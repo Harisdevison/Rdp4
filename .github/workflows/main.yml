@@ -70,76 +70,67 @@ jobs:
           $msi = "cloudflared.msi"
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.msi" -OutFile $msi
           Start-Process msiexec.exe -ArgumentList "/i $msi /quiet /norestart" -Wait
+          $cloudflaredPath = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
           Write-Host "cloudflared installed. Version:"
-          cloudflared --version
+          & $cloudflaredPath --version
 
       - name: Login cloudflared using API token
         shell: pwsh
         run: |
+          $cloudflared = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
           if (-not $env:CF_API_TOKEN) { Write-Error "CF_API_TOKEN not set"; exit 1 }
           Write-Host "Logging in cloudflared with token..."
-          cloudflared login --token $env:CF_API_TOKEN
-          Write-Host "Login command completed."
+          & $cloudflared login --token $env:CF_API_TOKEN
+          Write-Host "Login completed."
 
       - name: Ensure tunnel exists
         shell: pwsh
         run: |
+          $cloudflared = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
           $name = $env:TUNNEL_NAME
           if (-not $name) { Write-Error "TUNNEL_NAME not set"; exit 1 }
 
           Write-Host "Checking existing tunnels..."
-          $list = & cloudflared tunnel list 2>&1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "Warning: 'cloudflared tunnel list' returned non-zero exit code. Output:"
-            Write-Host $list
-          }
+          $list = & $cloudflared tunnel list 2>&1
+          if ($LASTEXITCODE -ne 0) { Write-Host "Warning: tunnel list returned non-zero exit code." }
 
           if ($list -match [regex]::Escape($name)) {
             Write-Host "Tunnel '$name' already exists. Skipping creation."
           } else {
             Write-Host "Creating tunnel '$name'..."
-            $createOut = & cloudflared tunnel create $name 2>&1
+            $createOut = & $cloudflared tunnel create $name 2>&1
             if ($LASTEXITCODE -ne 0) {
-              Write-Host "cloudflared tunnel create returned non-zero. Output:"
               Write-Host $createOut
               if ($createOut -match 'already exists' -or $createOut -match 'conflict') {
-                Write-Host "Tunnel appears to already exist. Continuing."
-              } else {
-                Write-Error "Failed to create tunnel. See output above."
-                exit 1
-              }
-            } else {
-              Write-Host "Tunnel created."
-            }
+                Write-Host "Tunnel already exists. Continuing."
+              } else { exit 1 }
+            } else { Write-Host "Tunnel created." }
           }
 
       - name: Ensure DNS route exists
         shell: pwsh
         run: |
+          $cloudflared = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
           $name = $env:TUNNEL_NAME
           $host = $env:RDP_SUBDOMAIN
           if (-not $host) { Write-Error "RDP_SUBDOMAIN not set"; exit 1 }
 
-          Write-Host "Creating DNS route for $host -> tunnel $name (if missing)..."
-          $routeOut = & cloudflared tunnel route dns $name $host 2>&1
+          Write-Host "Creating DNS route..."
+          $routeOut = & $cloudflared tunnel route dns $name $host 2>&1
           if ($LASTEXITCODE -ne 0) {
-            Write-Host "cloudflared tunnel route dns returned non-zero. Output:"
             Write-Host $routeOut
             if ($routeOut -match 'already exists' -or $routeOut -match 'already have a record') {
               Write-Host "DNS route already exists. Continuing."
-            } else {
-              Write-Host "Warning: could not create DNS route automatically. You may need to create CNAME/A record manually."
-            }
-          } else {
-            Write-Host "DNS route created."
-          }
+            } else { Write-Host "Warning: DNS route may need manual creation." }
+          } else { Write-Host "DNS route created." }
 
       - name: Run tunnel and expose RDP
         shell: pwsh
         run: |
+          $cloudflared = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
           $name = $env:TUNNEL_NAME
-          Write-Host "Starting cloudflared tunnel '$name' to expose RDP (rdp://localhost:3389)..."
-          cloudflared tunnel run $name --url rdp://localhost:3389
+          Write-Host "Starting cloudflared tunnel '$name' for RDP..."
+          & $cloudflared tunnel run $name --url rdp://localhost:3389
 
       - name: Show access info
         shell: pwsh
