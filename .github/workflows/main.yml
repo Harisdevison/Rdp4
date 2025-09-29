@@ -1,4 +1,4 @@
-name: Yanzz RDP via Cloudflare Tunnel
+name: Yanzz RDP
 
 on:
   workflow_dispatch:
@@ -8,115 +8,52 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 3600
 
-    env:
-      # subdomain will be constructed as rdp.${{ secrets.CF_ZONE }}
-      HOST_SUBDOMAIN: "rdp.${{ secrets.CF_ZONE }}"
-
     steps:
-      - name: Enable RDP & Firewall
-        shell: powershell
+      - name: Enable RDP
+        shell: pwsh
         run: |
-          Write-Host "Enabling Remote Desktop and opening firewall port 3389..."
+          Write-Host "Enabling RDP..."
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          # Disable NLA (optional) - uncomment only if needed
-          # Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="GitHub-RDP-3389" -ErrorAction SilentlyContinue
-          netsh advfirewall firewall add rule name="GitHub-RDP-3389" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
-          Start-Sleep -Seconds 3
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          Restart-Service TermService -Force
 
-      - name: Create local user with random secure password
-        shell: powershell
+      - name: Create User
+        shell: pwsh
         run: |
           Write-Host "Creating user 'Yanzz' with a random password..."
-          Add-Type -AssemblyName System.Web
-          function New-RandomPassword($length=16) {
-            $chars = ('abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ','0123456789','!@#$%^&*()-_=+[]{};:,.<>/?').Join('')
-            -join ((1..$length) | ForEach-Object { $chars | Get-Random -Count 1 })
-          }
-          $password = New-RandomPassword 16
-          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          $password = -join ((33..126) | Get-Random -Count 12 | % {[char]$_})
+          $secure   = ConvertTo-SecureString $password -AsPlainText -Force
           if (Get-LocalUser -Name "Yanzz" -ErrorAction SilentlyContinue) {
-            Write-Host "User exists — removing first..."
-            Remove-LocalUser -Name "Yanzz" -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 1
+            Remove-LocalUser -Name "Yanzz"
           }
-          New-LocalUser -Name "Yanzz" -Password $secure -AccountNeverExpires -PasswordNeverExpires
+          New-LocalUser -Name "Yanzz" -Password $secure -AccountNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "Yanzz"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Yanzz"
-          Write-Host "User created."
-          echo "RDP_USER=Yanzz" >> $env:GITHUB_ENV
-          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          "RDP_USER=Yanzz"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
-      - name: Install cloudflared (latest)
-        shell: powershell
+      - name: Install Cloudflared
+        shell: pwsh
         run: |
-          Write-Host "Downloading cloudflared..."
-          $out = "$env:USERPROFILE\cloudflared.exe"
-          $url = (Invoke-RestMethod -Uri "https://api.github.com/repos/cloudflare/cloudflared/releases/latest").assets |
-                 Where-Object { $_.name -match "cloudflared-windows-amd64.exe" } |
-                 Select-Object -First 1 -ExpandProperty browser_download_url
-          if (-not $url) {
-            # fallback direct link
-            $url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          }
-          Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing
-          # add to PATH for this job
-          echo "$env:USERPROFILE" >> $env:GITHUB_PATH
-          Write-Host "cloudflared downloaded to $out"
+          Write-Host "Installing cloudflared..."
+          Invoke-WebRequest https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe -OutFile cloudflared.exe
+          Move-Item cloudflared.exe $env:USERPROFILE\cloudflared.exe
+          echo "$env:USERPROFILE" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Start Cloudflare Tunnel (background) and verify
-        shell: powershell
+      - name: Start Cloudflare Tunnel
+        shell: pwsh
         run: |
-          $hostname = "${{ env.HOST_SUBDOMAIN }}"
-          Write-Host "Starting cloudflared tunnel for hostname: $hostname"
-          $exe = "$env:USERPROFILE\cloudflared.exe"
-          if (-not (Test-Path $exe)) {
-            Write-Error "cloudflared not found at $exe"
-            exit 1
-          }
+          $hostname="rdp.${{ secrets.CF_ZONE }}"
+          Write-Host "Starting Cloudflare Tunnel for $hostname ..."
+          Start-Process -FilePath "$env:USERPROFILE\cloudflared.exe" -ArgumentList "tunnel --no-autoupdate run --token ${{ secrets.CF_API_TOKEN }} --url rdp://localhost:3389 --hostname $hostname" -NoNewWindow
+          Start-Sleep -Seconds 15
 
-          # Start cloudflared in background (captures process)
-          $args = "tunnel --no-autoupdate run --token ${{ secrets.CF_API_TOKEN }} --url rdp://localhost:3389 --hostname $hostname"
-          Write-Host "Running: $exe $args"
-          $proc = Start-Process -FilePath $exe -ArgumentList $args -NoNewWindow -PassThru
-
-          # Wait and check if process is alive
-          Start-Sleep -Seconds 8
-          if ($proc -and -not $proc.HasExited) {
-            Write-Host "cloudflared started (PID $($proc.Id)). Waiting for tunnel to settle..."
-            Start-Sleep -Seconds 7
-          } else {
-            Write-Error "cloudflared failed to start or exited early."
-            Get-ChildItem "$env:USERPROFILE\cloudflared.exe" | Format-List
-            exit 1
-          }
-
-          # Simple DNS resolve test to ensure hostname exists
-          try {
-            $ips = Resolve-DnsName -Name $hostname -ErrorAction Stop
-            Write-Host "Hostname resolves: $hostname"
-            $ips | Select-Object -First 5 | Format-Table
-          } catch {
-            Write-Warning "Hostname $hostname does not yet resolve via DNS. If using cloudflared to auto-create DNS, allow a few seconds."
-          }
-
-          # Optional: test TCP (note: upstream Cloudflare proxies may not respond to direct TCP ping)
-          Write-Host "Pausing a moment. If you have Cloudflare Access rules or IP restrictions, configure them in the dashboard."
-          Start-Sleep -Seconds 3
-
-      - name: Show RDP Info (keeps job alive)
-        shell: powershell
+      - name: Show RDP Info
+        shell: pwsh
         run: |
-          Write-Host ""
-          Write-Host "=== RDP ACCESS ==="
-          Write-Host "Address: $($env.HOST_SUBDOMAIN):3389"
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: rdp.${{ secrets.CF_ZONE }}:3389"
           Write-Host "Username: $env:RDP_USER"
           Write-Host "Password: $env:RDP_PASS"
-          Write-Host "Workflow will keep running until you cancel it (Ctrl/Cmd + Cancel run)."
-          Write-Host "=================="
-          # keep job alive so tunnel stays up
-          while ($true) {
-            Write-Host \"[ $(Get-Date) ] RDP tunnel active at $($env.HOST_SUBDOMAIN):3389\"
-            Start-Sleep -Seconds 300
-          }
+          Write-Host "==================`n"
+          while ($true) { Start-Sleep -Seconds 300 }
