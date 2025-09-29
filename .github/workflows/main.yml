@@ -73,14 +73,14 @@ jobs:
 
           Write-Host "Attempt to locate cloudflared executable..."
 
-          # Common candidate locations
+          # Common candidate locations (expanded safely)
           $candidates = @(
-            "`$env:ProgramFiles\Cloudflare\Cloudflared\cloudflared.exe".Replace('`$env:ProgramFiles',$env:ProgramFiles),
-            "`$env:ProgramFiles\Cloudflare\cloudflared\cloudflared.exe".Replace('`$env:ProgramFiles',$env:ProgramFiles),
-            "`$env:ProgramFiles\cloudflared\cloudflared.exe".Replace('`$env:ProgramFiles',$env:ProgramFiles),
-            "`$env:ProgramFiles(x86)\Cloudflare\Cloudflared\cloudflared.exe".Replace('`$env:ProgramFiles(x86)',$env:ProgramFiles(x86)),
-            "$env:LOCALAPPDATA\Programs\cloudflared\cloudflared.exe",
-            "$env:USERPROFILE\cloudflared\cloudflared.exe"
+            "${env:ProgramFiles}\Cloudflare\Cloudflared\cloudflared.exe",
+            "${env:ProgramFiles}\Cloudflare\cloudflared\cloudflared.exe",
+            "${env:ProgramFiles}\cloudflared\cloudflared.exe",
+            "${env:ProgramFiles(x86)}\Cloudflare\Cloudflared\cloudflared.exe",
+            "${env:LOCALAPPDATA}\Programs\cloudflared\cloudflared.exe",
+            "${env:USERPROFILE}\cloudflared\cloudflared.exe"
           )
 
           $found = $null
@@ -99,10 +99,9 @@ jobs:
             } catch { }
           }
 
-          # Last resort: limited recursive search (first N matches)
+          # Last resort: limited recursive search (first match)
           if (-not $found) {
             Write-Host "Doing a limited recursive search for cloudflared.exe (may take a few seconds)..."
-            # Search common root folders to limit runtime
             $roots = @("C:\Program Files", "C:\Program Files (x86)", "C:\Users")
             foreach ($r in $roots) {
               try {
@@ -115,15 +114,13 @@ jobs:
           if (-not $found) {
             Write-Error "Could not locate cloudflared.exe after installation. List common dirs for debugging:"
             Write-Host "ProgramFiles: $env:ProgramFiles"
-            Write-Host "ProgramFiles(x86): $env:ProgramFiles(x86)"
+            Write-Host "ProgramFiles(x86): ${env:ProgramFiles(x86)}"
             Write-Host "LOCALAPPDATA: $env:LOCALAPPDATA"
             exit 1
           }
 
           Write-Host "Found cloudflared at: $found"
-          # Export for subsequent steps
           echo "CLOUDFLARED_PATH=$found" >> $env:GITHUB_ENV
-          # ensure session PATH includes the folder
           $folder = Split-Path $found -Parent
           $env:PATH = "$env:PATH;$folder"
           Write-Host "cloudflared version:"
