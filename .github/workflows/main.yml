@@ -6,41 +6,168 @@ on:
 jobs:
   rdp:
     runs-on: windows-latest
+    env:
+      RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      RDP_SUBDOMAIN: ${{ secrets.RDP_SUBDOMAIN }}
+      CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      TUNNEL_NAME: ${{ secrets.TUNNEL_NAME }}
+
     steps:
-      - name: Set environment variables
+      - name: Show basic info (secrets not printed)
         run: |
-          echo "RDP_USERNAME=${{ secrets.RDP_USERNAME }}" >> $GITHUB_ENV
-          echo "RDP_PASSWORD=${{ secrets.RDP_PASSWORD }}" >> $GITHUB_ENV
-          echo "RDP_SUBDOMAIN=${{ secrets.RDP_SUBDOMAIN }}" >> $GITHUB_ENV
-          echo "CF_API_TOKEN=${{ secrets.CF_API_TOKEN }}" >> $GITHUB_ENV
+          Write-Host "Starting Windows RDP setup via Cloudflare Tunnel..."
+          Write-Host "Target subdomain: $env:RDP_SUBDOMAIN"
+        shell: pwsh
 
       - name: Enable RDP & Firewall
+        shell: pwsh
         run: |
+          Write-Host "Enabling RDP and firewall rules..."
           Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "RDP and firewall configured."
 
-      - name: Create RDP user
+      - name: Create RDP user (robust, PowerShell)
+        shell: pwsh
         run: |
-          net user $env:RDP_USERNAME $env:RDP_PASSWORD /add
-          net localgroup "Administrators" $env:RDP_USERNAME /add
+          # basic reserved names check
+          if ($env:RDP_USERNAME -match '^(Administrators|Users|Guests|DefaultAccount|WDAGUtilityAccount)$') {
+            Write-Error "RDP_USERNAME appears to be a reserved account/group name. Choose a different username."
+            exit 1
+          }
+
+          # Create user if not exists
+          $existing = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          if ($existing) {
+            Write-Host "User '$($env:RDP_USERNAME)' already exists. Skipping creation."
+          } else {
+            $securePass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+            try {
+              New-LocalUser -Name $env:RDP_USERNAME -Password $securePass -FullName $env:RDP_USERNAME -PasswordNeverExpires -AccountNeverExpires
+              Write-Host "User '$($env:RDP_USERNAME)' created."
+            } catch {
+              Write-Error "Failed to create user: $($_.Exception.Message)"
+              exit 1
+            }
+          }
+
+          # Add to Administrators if not already
+          $isMember = Get-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
+          if ($isMember) {
+            Write-Host "User is already a member of Administrators."
+          } else {
+            try {
+              Add-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME
+              Write-Host "Added user to Administrators group."
+            } catch {
+              Write-Error "Failed to add user to Administrators: $($_.Exception.Message)"
+              exit 1
+            }
+          }
 
       - name: Install cloudflared
+        shell: pwsh
         run: |
-          Invoke-WebRequest -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.msi -OutFile cloudflared.msi
-          Start-Process msiexec.exe -ArgumentList '/i cloudflared.msi /quiet' -Wait
+          Write-Host "Installing cloudflared..."
+          $msi = "cloudflared.msi"
+          Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i $msi /quiet /norestart" -Wait
+          Write-Host "cloudflared installed. Version:"
+          cloudflared --version
 
-      - name: Login cloudflared using API token
+      - name: Login cloudflared using API token (non-interactive)
+        shell: pwsh
         run: |
+          if (-not $env:CF_API_TOKEN) { Write-Error "CF_API_TOKEN not set"; exit 1 }
+          Write-Host "Logging in cloudflared with token..."
           cloudflared login --token $env:CF_API_TOKEN
+          Write-Host "Login command completed."
 
-      - name: Create and run tunnel
+      - name: Ensure tunnel exists (create if missing)
+        shell: pwsh
         run: |
-          cloudflared tunnel create rdp-tunnel
-          cloudflared tunnel route dns rdp-tunnel $env:RDP_SUBDOMAIN
-          cloudflared tunnel run rdp-tunnel
-          
-      - name: Show access info
+          $name = $env:TUNNEL_NAME
+          if (-not $name) { Write-Error "TUNNEL_NAME not set"; exit 1 }
+
+          Write-Host "Checking existing tunnels..."
+          $list = & cloudflared tunnel list 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "Warning: 'cloudflared tunnel list' returned non-zero exit code. Output:"
+            Write-Host $list
+            # continue - we'll attempt to create anyway
+          }
+
+          if ($list -match [regex]::Escape($name)) {
+            Write-Host "Tunnel '$name' already exists. Skipping creation."
+          } else {
+            Write-Host "Creating tunnel '$name'..."
+            $createOut = & cloudflared tunnel create $name 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "cloudflared tunnel create returned non-zero code. Output:"
+              Write-Host $createOut
+              # if error indicates 'already exists', continue; otherwise fail
+              if ($createOut -match 'already exists' -or $createOut -match 'conflict') {
+                Write-Host "Tunnel appears to already exist (conflict). Continuing."
+              } else {
+                Write-Error "Failed to create tunnel. See output above."
+                exit 1
+              }
+            } else {
+              Write-Host "Tunnel created."
+            }
+          }
+
+      - name: Ensure DNS route exists (ignore if already present)
+        shell: pwsh
         run: |
-          echo "RDP Host: $env:RDP_SUBDOMAIN"
-          echo "Username: $env:RDP_USERNAME"
-          echo "Password: $env:RDP_PASSWORD"
+          $name = $env:TUNNEL_NAME
+          $host = $env:RDP_SUBDOMAIN
+          if (-not $host) { Write-Error "RDP_SUBDOMAIN not set"; exit 1 }
+
+          Write-Host "Creating DNS route for $host -> tunnel $name (if missing)..."
+          $routeOut = & cloudflared tunnel route dns $name $host 2>&1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "cloudflared tunnel route dns returned non-zero. Output:"
+            Write-Host $routeOut
+            if ($routeOut -match 'already exists' -or $routeOut -match 'already have a record') {
+              Write-Host "DNS route already exists. Continuing."
+            } else {
+              # not fatal in many cases (if DNS created via dashboard). Warn but continue.
+              Write-Host "Warning: could not create DNS route automatically. You may need to create CNAME/A record for $host pointing to tunnel or use dashboard."
+            }
+          } else {
+            Write-Host "DNS route created."
+          }
+
+      - name: Run tunnel and expose RDP (foreground)
+        shell: pwsh
+        run: |
+          $name = $env:TUNNEL_NAME
+          $host = $env:RDP_SUBDOMAIN
+          Write-Host "Starting cloudflared tunnel '$name' to expose RDP (rdp://localhost:3389)..."
+          # Try the common syntaxes (some versions differ). Try direct run with --url first.
+          $cmd1 = "cloudflared tunnel run $name --url rdp://localhost:3389"
+          $cmd2 = "cloudflared tunnel --url rdp://localhost:3389 run $name"
+          Write-Host "Trying: $cmd1"
+          iex $cmd1
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "First run form failed, trying alternative..."
+            Write-Host "Trying: $cmd2"
+            iex $cmd2
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "Failed to start tunnel with known CLI forms. See logs above."
+              exit 1
+            }
+          }
+
+      - name: Show access info (note: runner will keep this job active until cancelled or timeout)
+        shell: pwsh
+        run: |
+          Write-Host "===================================================="
+          Write-Host "RDP should be available at: $env:RDP_SUBDOMAIN"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: (secret)"
+          Write-Host "Reminder: GitHub Actions runner is temporary — not 24/7."
+          Write-Host "To stop the tunnel, cancel this workflow run."
+          Write-Host "===================================================="
