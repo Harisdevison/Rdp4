@@ -1,4 +1,4 @@
-name: Windows RDP via Cloudflare Tunnel
+name: Windows RDP via Cloudflare Tunnel (auto-tunnelname)
 
 on:
   workflow_dispatch:
@@ -11,6 +11,7 @@ jobs:
       RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
       RDP_SUBDOMAIN: ${{ secrets.RDP_SUBDOMAIN }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+      # TUNNEL_NAME secret is optional now; workflow will generate one if missing
       TUNNEL_NAME: ${{ secrets.TUNNEL_NAME }}
 
     steps:
@@ -19,6 +20,22 @@ jobs:
         run: |
           Write-Host "Starting Windows RDP setup via Cloudflare Tunnel..."
           Write-Host "Target subdomain: $env:RDP_SUBDOMAIN"
+
+      - name: Ensure TUNNEL_NAME exists (generate if missing)
+        shell: pwsh
+        run: |
+          if (-not $env:TUNNEL_NAME -or $env:TUNNEL_NAME -eq "") {
+            # Use run id + timestamp to generate reasonably-unique name
+            $runId = $env:GITHUB_RUN_ID
+            if (-not $runId) { $runId = (Get-Random -Maximum 999999) }
+            $ts = (Get-Date).ToString("yyyyMMddHHmmss")
+            $generated = "rdp-tunnel-$runId-$ts"
+            Write-Host "TUNNEL_NAME not provided. Generating: $generated"
+            echo "TUNNEL_NAME=$generated" >> $env:GITHUB_ENV
+            $env:TUNNEL_NAME = $generated
+          } else {
+            Write-Host "Using provided TUNNEL_NAME: $env:TUNNEL_NAME"
+          }
 
       - name: Enable RDP & Firewall
         shell: pwsh
@@ -72,8 +89,6 @@ jobs:
           Start-Process msiexec.exe -ArgumentList "/i $msi /quiet /norestart" -Wait
 
           Write-Host "Attempt to locate cloudflared executable..."
-
-          # Common candidate locations (expanded safely)
           $candidates = @(
             "${env:ProgramFiles}\Cloudflare\Cloudflared\cloudflared.exe",
             "${env:ProgramFiles}\Cloudflare\cloudflared\cloudflared.exe",
@@ -91,7 +106,6 @@ jobs:
             }
           }
 
-          # Try where.exe (if MSI added to PATH)
           if (-not $found) {
             try {
               $where = (where.exe cloudflared 2>$null) -split "`r?`n" | Select-Object -First 1
@@ -99,7 +113,6 @@ jobs:
             } catch { }
           }
 
-          # Last resort: limited recursive search (first match)
           if (-not $found) {
             Write-Host "Doing a limited recursive search for cloudflared.exe (may take a few seconds)..."
             $roots = @("C:\Program Files", "C:\Program Files (x86)", "C:\Users")
@@ -112,7 +125,7 @@ jobs:
           }
 
           if (-not $found) {
-            Write-Error "Could not locate cloudflared.exe after installation. List common dirs for debugging:"
+            Write-Error "Could not locate cloudflared.exe after installation. Common dirs:"
             Write-Host "ProgramFiles: $env:ProgramFiles"
             Write-Host "ProgramFiles(x86): ${env:ProgramFiles(x86)}"
             Write-Host "LOCALAPPDATA: $env:LOCALAPPDATA"
@@ -141,7 +154,7 @@ jobs:
         run: |
           $cloudflared = $env:CLOUDFLARED_PATH
           $name = $env:TUNNEL_NAME
-          if (-not $name) { Write-Error "TUNNEL_NAME not set"; exit 1 }
+          if (-not $name) { Write-Error "Unexpected: TUNNEL_NAME still not set"; exit 1 }
 
           Write-Host "Checking existing tunnels..."
           $list = & $cloudflared tunnel list 2>&1
@@ -190,6 +203,7 @@ jobs:
         run: |
           Write-Host "===================================================="
           Write-Host "RDP should be available at: $env:RDP_SUBDOMAIN"
+          Write-Host "Tunnel name: $env:TUNNEL_NAME"
           Write-Host "Username: $env:RDP_USERNAME"
           Write-Host "Password: (secret)"
           Write-Host "Reminder: GitHub Actions runner is temporary — not 24/7."
