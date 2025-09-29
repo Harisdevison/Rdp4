@@ -14,11 +14,11 @@ jobs:
       TUNNEL_NAME: ${{ secrets.TUNNEL_NAME }}
 
     steps:
-      - name: Show basic info (secrets not printed)
+      - name: Show basic info
+        shell: pwsh
         run: |
           Write-Host "Starting Windows RDP setup via Cloudflare Tunnel..."
           Write-Host "Target subdomain: $env:RDP_SUBDOMAIN"
-        shell: pwsh
 
       - name: Enable RDP & Firewall
         shell: pwsh
@@ -28,16 +28,14 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Write-Host "RDP and firewall configured."
 
-      - name: Create RDP user (robust, PowerShell)
+      - name: Create RDP user (PowerShell robust)
         shell: pwsh
         run: |
-          # basic reserved names check
           if ($env:RDP_USERNAME -match '^(Administrators|Users|Guests|DefaultAccount|WDAGUtilityAccount)$') {
             Write-Error "RDP_USERNAME appears to be a reserved account/group name. Choose a different username."
             exit 1
           }
 
-          # Create user if not exists
           $existing = Get-LocalUser -Name $env:RDP_USERNAME -ErrorAction SilentlyContinue
           if ($existing) {
             Write-Host "User '$($env:RDP_USERNAME)' already exists. Skipping creation."
@@ -52,7 +50,6 @@ jobs:
             }
           }
 
-          # Add to Administrators if not already
           $isMember = Get-LocalGroupMember -Group "Administrators" -Member $env:RDP_USERNAME -ErrorAction SilentlyContinue
           if ($isMember) {
             Write-Host "User is already a member of Administrators."
@@ -76,7 +73,7 @@ jobs:
           Write-Host "cloudflared installed. Version:"
           cloudflared --version
 
-      - name: Login cloudflared using API token (non-interactive)
+      - name: Login cloudflared using API token
         shell: pwsh
         run: |
           if (-not $env:CF_API_TOKEN) { Write-Error "CF_API_TOKEN not set"; exit 1 }
@@ -84,7 +81,7 @@ jobs:
           cloudflared login --token $env:CF_API_TOKEN
           Write-Host "Login command completed."
 
-      - name: Ensure tunnel exists (create if missing)
+      - name: Ensure tunnel exists
         shell: pwsh
         run: |
           $name = $env:TUNNEL_NAME
@@ -95,7 +92,6 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             Write-Host "Warning: 'cloudflared tunnel list' returned non-zero exit code. Output:"
             Write-Host $list
-            # continue - we'll attempt to create anyway
           }
 
           if ($list -match [regex]::Escape($name)) {
@@ -104,11 +100,10 @@ jobs:
             Write-Host "Creating tunnel '$name'..."
             $createOut = & cloudflared tunnel create $name 2>&1
             if ($LASTEXITCODE -ne 0) {
-              Write-Host "cloudflared tunnel create returned non-zero code. Output:"
+              Write-Host "cloudflared tunnel create returned non-zero. Output:"
               Write-Host $createOut
-              # if error indicates 'already exists', continue; otherwise fail
               if ($createOut -match 'already exists' -or $createOut -match 'conflict') {
-                Write-Host "Tunnel appears to already exist (conflict). Continuing."
+                Write-Host "Tunnel appears to already exist. Continuing."
               } else {
                 Write-Error "Failed to create tunnel. See output above."
                 exit 1
@@ -118,7 +113,7 @@ jobs:
             }
           }
 
-      - name: Ensure DNS route exists (ignore if already present)
+      - name: Ensure DNS route exists
         shell: pwsh
         run: |
           $name = $env:TUNNEL_NAME
@@ -133,35 +128,20 @@ jobs:
             if ($routeOut -match 'already exists' -or $routeOut -match 'already have a record') {
               Write-Host "DNS route already exists. Continuing."
             } else {
-              # not fatal in many cases (if DNS created via dashboard). Warn but continue.
-              Write-Host "Warning: could not create DNS route automatically. You may need to create CNAME/A record for $host pointing to tunnel or use dashboard."
+              Write-Host "Warning: could not create DNS route automatically. You may need to create CNAME/A record manually."
             }
           } else {
             Write-Host "DNS route created."
           }
 
-      - name: Run tunnel and expose RDP (foreground)
+      - name: Run tunnel and expose RDP
         shell: pwsh
         run: |
           $name = $env:TUNNEL_NAME
-          $host = $env:RDP_SUBDOMAIN
           Write-Host "Starting cloudflared tunnel '$name' to expose RDP (rdp://localhost:3389)..."
-          # Try the common syntaxes (some versions differ). Try direct run with --url first.
-          $cmd1 = "cloudflared tunnel run $name --url rdp://localhost:3389"
-          $cmd2 = "cloudflared tunnel --url rdp://localhost:3389 run $name"
-          Write-Host "Trying: $cmd1"
-          iex $cmd1
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "First run form failed, trying alternative..."
-            Write-Host "Trying: $cmd2"
-            iex $cmd2
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "Failed to start tunnel with known CLI forms. See logs above."
-              exit 1
-            }
-          }
+          cloudflared tunnel run $name --url rdp://localhost:3389
 
-      - name: Show access info (note: runner will keep this job active until cancelled or timeout)
+      - name: Show access info
         shell: pwsh
         run: |
           Write-Host "===================================================="
