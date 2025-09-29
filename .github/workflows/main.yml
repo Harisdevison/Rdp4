@@ -1,4 +1,4 @@
-name: Yanzz RDP
+name: Windows RDP via Cloudflare Tunnel
 
 on:
   workflow_dispatch:
@@ -6,54 +6,41 @@ on:
 jobs:
   rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
-
     steps:
-      - name: Enable RDP
-        shell: pwsh
+      - name: Set environment variables
         run: |
-          Write-Host "Enabling RDP..."
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service TermService -Force
+          echo "RDP_USERNAME=${{ secrets.RDP_USERNAME }}" >> $GITHUB_ENV
+          echo "RDP_PASSWORD=${{ secrets.RDP_PASSWORD }}" >> $GITHUB_ENV
+          echo "RDP_SUBDOMAIN=${{ secrets.RDP_SUBDOMAIN }}" >> $GITHUB_ENV
+          echo "CF_API_TOKEN=${{ secrets.CF_API_TOKEN }}" >> $GITHUB_ENV
 
-      - name: Create User
-        shell: pwsh
+      - name: Enable RDP & Firewall
         run: |
-          Write-Host "Creating user 'Yanzz' with a random password..."
-          $password = -join ((33..126) | Get-Random -Count 12 | % {[char]$_})
-          $secure   = ConvertTo-SecureString $password -AsPlainText -Force
-          if (Get-LocalUser -Name "Yanzz" -ErrorAction SilentlyContinue) {
-            Remove-LocalUser -Name "Yanzz"
-          }
-          New-LocalUser -Name "Yanzz" -Password $secure -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "Yanzz"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "Yanzz"
-          "RDP_USER=Yanzz"  | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "RDP_PASS=$password" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Set-ItemProperty -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
 
-      - name: Install Cloudflared
-        shell: pwsh
+      - name: Create RDP user
         run: |
-          Write-Host "Installing cloudflared..."
-          Invoke-WebRequest https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe -OutFile cloudflared.exe
-          Move-Item cloudflared.exe $env:USERPROFILE\cloudflared.exe
-          echo "$env:USERPROFILE" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          net user $env:RDP_USERNAME $env:RDP_PASSWORD /add
+          net localgroup "Administrators" $env:RDP_USERNAME /add
 
-      - name: Start Cloudflare Tunnel
-        shell: pwsh
+      - name: Install cloudflared
         run: |
-          $hostname="rdp.${{ secrets.CF_ZONE }}"
-          Write-Host "Starting Cloudflare Tunnel for $hostname ..."
-          Start-Process -FilePath "$env:USERPROFILE\cloudflared.exe" -ArgumentList "tunnel --no-autoupdate run --token ${{ secrets.CF_API_TOKEN }} --url rdp://localhost:3389 --hostname $hostname" -NoNewWindow
-          Start-Sleep -Seconds 15
+          Invoke-WebRequest -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.msi -OutFile cloudflared.msi
+          Start-Process msiexec.exe -ArgumentList '/i cloudflared.msi /quiet' -Wait
 
-      - name: Show RDP Info
-        shell: pwsh
+      - name: Login cloudflared using API token
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: rdp.${{ secrets.CF_ZONE }}:3389"
-          Write-Host "Username: $env:RDP_USER"
-          Write-Host "Password: $env:RDP_PASS"
-          Write-Host "==================`n"
-          while ($true) { Start-Sleep -Seconds 300 }
+          cloudflared login --token $env:CF_API_TOKEN
+
+      - name: Create and run tunnel
+        run: |
+          cloudflared tunnel create rdp-tunnel
+          cloudflared tunnel route dns rdp-tunnel $env:RDP_SUBDOMAIN
+          cloudflared tunnel run rdp-tunnel
+          
+      - name: Show access info
+        run: |
+          echo "RDP Host: $env:RDP_SUBDOMAIN"
+          echo "Username: $env:RDP_USERNAME"
+          echo "Password: $env:RDP_PASSWORD"
