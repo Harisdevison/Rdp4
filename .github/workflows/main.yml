@@ -63,22 +63,78 @@ jobs:
             }
           }
 
-      - name: Install cloudflared
+      - name: Install cloudflared and locate executable
         shell: pwsh
         run: |
-          Write-Host "Installing cloudflared..."
+          Write-Host "Installing cloudflared (MSI)..."
           $msi = "cloudflared.msi"
           Invoke-WebRequest -Uri "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.msi" -OutFile $msi
           Start-Process msiexec.exe -ArgumentList "/i $msi /quiet /norestart" -Wait
-          $cloudflaredPath = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
-          Write-Host "cloudflared installed. Version:"
-          & $cloudflaredPath --version
+
+          Write-Host "Attempt to locate cloudflared executable..."
+
+          # Common candidate locations
+          $candidates = @(
+            "`$env:ProgramFiles\Cloudflare\Cloudflared\cloudflared.exe".Replace('`$env:ProgramFiles',$env:ProgramFiles),
+            "`$env:ProgramFiles\Cloudflare\cloudflared\cloudflared.exe".Replace('`$env:ProgramFiles',$env:ProgramFiles),
+            "`$env:ProgramFiles\cloudflared\cloudflared.exe".Replace('`$env:ProgramFiles',$env:ProgramFiles),
+            "`$env:ProgramFiles(x86)\Cloudflare\Cloudflared\cloudflared.exe".Replace('`$env:ProgramFiles(x86)',$env:ProgramFiles(x86)),
+            "$env:LOCALAPPDATA\Programs\cloudflared\cloudflared.exe",
+            "$env:USERPROFILE\cloudflared\cloudflared.exe"
+          )
+
+          $found = $null
+          foreach ($p in $candidates) {
+            if ($p -and (Test-Path $p)) {
+              $found = $p
+              break
+            }
+          }
+
+          # Try where.exe (if MSI added to PATH)
+          if (-not $found) {
+            try {
+              $where = (where.exe cloudflared 2>$null) -split "`r?`n" | Select-Object -First 1
+              if ($where -and (Test-Path $where)) { $found = $where }
+            } catch { }
+          }
+
+          # Last resort: limited recursive search (first N matches)
+          if (-not $found) {
+            Write-Host "Doing a limited recursive search for cloudflared.exe (may take a few seconds)..."
+            # Search common root folders to limit runtime
+            $roots = @("C:\Program Files", "C:\Program Files (x86)", "C:\Users")
+            foreach ($r in $roots) {
+              try {
+                $hit = Get-ChildItem -Path $r -Filter cloudflared.exe -Recurse -ErrorAction SilentlyContinue -Force | Select-Object -First 1
+                if ($hit) { $found = $hit.FullName; break }
+              } catch { }
+            }
+          }
+
+          if (-not $found) {
+            Write-Error "Could not locate cloudflared.exe after installation. List common dirs for debugging:"
+            Write-Host "ProgramFiles: $env:ProgramFiles"
+            Write-Host "ProgramFiles(x86): $env:ProgramFiles(x86)"
+            Write-Host "LOCALAPPDATA: $env:LOCALAPPDATA"
+            exit 1
+          }
+
+          Write-Host "Found cloudflared at: $found"
+          # Export for subsequent steps
+          echo "CLOUDFLARED_PATH=$found" >> $env:GITHUB_ENV
+          # ensure session PATH includes the folder
+          $folder = Split-Path $found -Parent
+          $env:PATH = "$env:PATH;$folder"
+          Write-Host "cloudflared version:"
+          & $found --version
 
       - name: Login cloudflared using API token
         shell: pwsh
         run: |
-          $cloudflared = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
+          $cloudflared = $env:CLOUDFLARED_PATH
           if (-not $env:CF_API_TOKEN) { Write-Error "CF_API_TOKEN not set"; exit 1 }
+          if (-not (Test-Path $cloudflared)) { Write-Error "cloudflared not found at $cloudflared"; exit 1 }
           Write-Host "Logging in cloudflared with token..."
           & $cloudflared login --token $env:CF_API_TOKEN
           Write-Host "Login completed."
@@ -86,15 +142,15 @@ jobs:
       - name: Ensure tunnel exists
         shell: pwsh
         run: |
-          $cloudflared = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
+          $cloudflared = $env:CLOUDFLARED_PATH
           $name = $env:TUNNEL_NAME
           if (-not $name) { Write-Error "TUNNEL_NAME not set"; exit 1 }
 
           Write-Host "Checking existing tunnels..."
           $list = & $cloudflared tunnel list 2>&1
-          if ($LASTEXITCODE -ne 0) { Write-Host "Warning: tunnel list returned non-zero exit code." }
+          if ($LASTEXITCODE -ne 0) { Write-Host "Warning: tunnel list returned non-zero exit code. Output:"; Write-Host $list }
 
-          if ($list -match [regex]::Escape($name)) {
+          if ($list -and ($list -match [regex]::Escape($name))) {
             Write-Host "Tunnel '$name' already exists. Skipping creation."
           } else {
             Write-Host "Creating tunnel '$name'..."
@@ -110,7 +166,7 @@ jobs:
       - name: Ensure DNS route exists
         shell: pwsh
         run: |
-          $cloudflared = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
+          $cloudflared = $env:CLOUDFLARED_PATH
           $name = $env:TUNNEL_NAME
           $host = $env:RDP_SUBDOMAIN
           if (-not $host) { Write-Error "RDP_SUBDOMAIN not set"; exit 1 }
@@ -121,15 +177,15 @@ jobs:
             Write-Host $routeOut
             if ($routeOut -match 'already exists' -or $routeOut -match 'already have a record') {
               Write-Host "DNS route already exists. Continuing."
-            } else { Write-Host "Warning: DNS route may need manual creation." }
+            } else { Write-Host "Warning: DNS route may need manual creation in Cloudflare dashboard." }
           } else { Write-Host "DNS route created." }
 
-      - name: Run tunnel and expose RDP
+      - name: Run tunnel and expose RDP (foreground)
         shell: pwsh
         run: |
-          $cloudflared = "C:\Program Files\Cloudflare\Cloudflared\cloudflared.exe"
+          $cloudflared = $env:CLOUDFLARED_PATH
           $name = $env:TUNNEL_NAME
-          Write-Host "Starting cloudflared tunnel '$name' for RDP..."
+          Write-Host "Starting cloudflared tunnel '$name' for RDP (rdp://localhost:3389)..."
           & $cloudflared tunnel run $name --url rdp://localhost:3389
 
       - name: Show access info
